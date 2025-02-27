@@ -1,11 +1,12 @@
-import { FC } from 'react';
+import { type FC } from 'react';
 import React from 'react';
 import { useRouteLoaderData } from 'react-router-dom';
 
-import { isRemoteProject } from '../../../models/project';
-import { OrganizationFeatureLoaderData } from '../../routes/organization';
+import { isGitProject, isRemoteProject } from '../../../models/project';
+import { useOrganizationPermissions } from '../../hooks/use-organization-features';
 import { useRootLoaderData } from '../../routes/root';
-import { WorkspaceLoaderData } from '../../routes/workspace';
+import type { WorkspaceLoaderData } from '../../routes/workspace';
+import { GitProjectSyncDropdown } from './git-project-sync-dropdown';
 import { GitSyncDropdown } from './git-sync-dropdown';
 import { SyncDropdown } from './sync-dropdown';
 
@@ -20,7 +21,8 @@ export const WorkspaceSyncDropdown: FC = () => {
   ) as WorkspaceLoaderData;
 
   const { userSession } = useRootLoaderData();
-  const { features } = useRouteLoaderData(':organizationId') as OrganizationFeatureLoaderData;
+
+  const { features } = useOrganizationPermissions();
 
   if (!userSession.id) {
     return null;
@@ -42,7 +44,11 @@ export const WorkspaceSyncDropdown: FC = () => {
 
   const shouldShowGitSyncDropdown = features.gitSync.enabled && (activeWorkspaceMeta?.gitRepositoryId || !isRemoteProject(activeProject));
   if (shouldShowGitSyncDropdown) {
-    return <GitSyncDropdown isInsomniaSyncEnabled={isRemoteProject(activeProject)} gitRepository={gitRepository} />;
+    if (isGitProject(activeProject)) {
+      return <GitProjectSyncDropdown key={gitRepository?._id} gitRepository={gitRepository} />;
+    }
+
+    return <GitSyncDropdown key={gitRepository?._id} isInsomniaSyncEnabled={isRemoteProject(activeProject)} gitRepository={gitRepository} />;
   }
 
   return null;

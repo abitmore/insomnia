@@ -1,4 +1,5 @@
 name: Release Publish
+run-name: Publish ${{ github.event.inputs.version }} channel by @${{ github.actor }}
 
 on:
   workflow_dispatch:
@@ -12,11 +13,25 @@ env:
   RELEASE_CORE_TAG: core@${{ github.event.inputs.version }}
   RELEASE_BRANCH: release/${{ github.event.inputs.version }}
   IS_PRERELEASE: ${{ contains(github.event.inputs.version, 'alpha') || contains(github.event.inputs.version, 'beta') }}
+  ARTIFACTS_DOWNLOAD_PATH: ${{ github.workspace }}/artifacts
+  INSO_DOCKER_IMAGE: kong/inso # By default, registry is docker.io
+  NOTARY_REPOSITORY: 'kong/notary' # All signatures will be pushed to public notary repository
+  ARTIFACTS_REPOSITORY: ${{  vars.ARTIFACTS_REPOSITORY }}
 
 jobs:
   publish:
     timeout-minutes: 15
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+    outputs:
+      NOTARY_REPOSITORY: ${{ env.NOTARY_REPOSITORY }}
+      INSO_DOCKER_IMAGE: ${{ env.INSO_DOCKER_IMAGE }}
+      INSO_DOCKER_IMAGE_DIGEST: ${{ steps.image_manifest_metadata.outputs.inso_image_sha }}
+      INSOMNIA_RELEASE_TAG: ${{ env.RELEASE_CORE_TAG }}
+    permissions:
+      id-token: write # needed for signing the images
+      actions: read # For getting workflow run info for keyless signing of docker image
+      contents: write # Required to upload assets. Issue: https://github.com/slsa-framework/slsa-github-generator/tree/main/internal/builders/container#known-issues
+      packages: write
     steps:
       - name: Checkout branch # Check out the release branch
         uses: actions/checkout@v4
@@ -35,76 +50,84 @@ jobs:
       - name: Install packages
         run: npm ci
 
-      - name: Download artifact
-        uses: dawidd6/action-download-artifact@v2
+      - name: Download release artifacts from insomnia-ee
+        uses: robinraju/release-downloader@v1
         with:
-          github_token: ${{secrets.GITHUB_TOKEN}}
-          workflow: release-build.yml
-          workflow_conclusion: success
-          branch: ${{ env.RELEASE_BRANCH }} # Branch workflow ran on != branch the workflow created
-          path: ./artifacts/
+          repository: ${{ env.ARTIFACTS_REPOSITORY }}
+          tag: core@${{ env.RELEASE_VERSION }}
+          fileName: '*'
+          token: ${{ secrets.EE_DOWNLOAD_TOKEN }}
+          out-file-path: ${{ env.ARTIFACTS_DOWNLOAD_PATH }}
 
-      - name: Temporarily move Windows artifacts
-        shell: bash
+      - name: Docker meta for Inso CLI Docker Image
+        id: inso_docker_meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.INSO_DOCKER_IMAGE }}
+          tags: |
+            type=raw,value=${{ env.RELEASE_VERSION }},priority=1000
+            type=raw,value=latest,enable=${{ env.IS_PRERELEASE == 'false' }}
+            type=raw,value=alpha,enable=${{ env.IS_PRERELEASE == 'true' && contains(github.event.inputs.version, 'alpha') }}
+            type=raw,value=beta,enable=${{ env.IS_PRERELEASE == 'true' && contains(github.event.inputs.version, 'beta') }}
+          sep-tags: ","
+
+      # Setup regctl to parse platform specific image digest from image manifest
+      - name: Install regctl
+        uses: regclient/actions/regctl-installer@main
+
+      # The image manifest digest/sha is generated only after the image is published to registry
+      - name: Parse architecture specific digest from image manifest
+        id: image_manifest_metadata
         run: |
-          mv ./artifacts/windows-latest-artifacts/insomnia/dist/squirrel-windows/Insomnia.Core-${{ env.RELEASE_VERSION }}.exe ./artifacts/
+          INSO_IMAGE=${{ env.INSO_DOCKER_IMAGE }}:${{ steps.inso_docker_meta.outputs.version }}
+          inso_image_sha="$(regctl image digest "${INSO_IMAGE}")"
+          echo "inso_image_sha=${inso_image_sha}" >> $GITHUB_OUTPUT
 
-      - name: Code-sign Windows .exe artifact
-        uses: sslcom/actions-codesigner@develop
-        with:
-          command: sign
-          username: ${{secrets.ES_USERNAME}}
-          password: ${{secrets.ES_PASSWORD}}
-          credential_id: ${{secrets.ES_CREDENTIAL_ID}}
-          totp_secret: ${{secrets.ES_TOTP_SECRET}}
-          file_path: ${GITHUB_WORKSPACE}/artifacts/Insomnia.Core-${{ env.RELEASE_VERSION }}.exe
-          output_path: ${GITHUB_WORKSPACE}/artifacts/windows-latest-artifacts/insomnia/dist/squirrel-windows
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@4959ce089c160fddf62f7b42464195ba1a56d382
 
-      # - name: Code-sign Windows portable .exe artifact
-      #   uses: sslcom/actions-codesigner@develop
-      #   with:
-      #     command: sign
-      #     username: ${{secrets.ES_USERNAME}}
-      #     password: ${{secrets.ES_PASSWORD}}
-      #     credential_id: ${{secrets.ES_CREDENTIAL_ID}}
-      #     totp_secret: ${{secrets.ES_TOTP_SECRET}}
-      #     file_path: ${GITHUB_WORKSPACE}/artifacts/Insomnia.Core-${{ env.RELEASE_VERSION }}-portable.exe
-      #     output_path: ${GITHUB_WORKSPACE}/artifacts/windows-latest-artifacts/insomnia/dist
-
-      - name: Set Inso CLI version on Github Env
-        run:
-          echo "INSO_VERSION=$(jq .version packages/insomnia-inso/package.json -rj)" >> $GITHUB_ENV
-
-      - name: Create Release for Inso CLI
-        uses: ncipollo/release-action@v1
-        id: release_inso_cli
-        with:
-          tag: lib@${{ env.INSO_VERSION }}
-          name: "Inso CLI ${{ env.INSO_VERSION }} 📦"
-          generateReleaseNotes: false
-          commit: ${{ env.RELEASE_BRANCH }}
-          prerelease: ${{ env.IS_PRERELEASE }}
-          draft: false
+      - name: Verify Inso Container Image Signature produced on insomnia-ee
+        run: |
+          cosign verify \
+          kong/inso:${{env.RELEASE_VERSION}}@${{steps.image_manifest_metadata.outputs.inso_image_sha}} \
+          --certificate-oidc-issuer='https://token.actions.githubusercontent.com' \
+          --certificate-identity-regexp='https://github.com/Kong/insomnia-ee/.github/workflows/release-publish.yml'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COSIGN_REPOSITORY: ${{env.NOTARY_REPOSITORY}}
 
-      - name: Upload Inso CLI artifacts to release
-        uses: xresloader/upload-to-github-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          release_id: ${{ steps.release_inso_cli.outputs.id }}
-          tag_name: lib@${{ env.INSO_VERSION }}
-          file: "./artifacts/*-latest-artifacts/insomnia-inso/artifacts/**"
-          prerelease: ${{ env.IS_PRERELEASE }}
-          draft: false
+      - name: Install slsa verifier
+        uses: slsa-framework/slsa-verifier/actions/installer@6657aada084353c65e5dde35394b1a010289fab0
+
+      - name: Verify Inso Container Image Provenance produced on insomnia-ee
+        run: |
+         slsa-verifier verify-image \
+         kong/inso:${{env.RELEASE_VERSION}}@${{steps.image_manifest_metadata.outputs.inso_image_sha}} \
+         --print-provenance \
+         --provenance-repository ${{env.NOTARY_REPOSITORY}} \
+         --source-uri 'github.com/Kong/insomnia-ee'
+
+      - name: Verify Inso Binary Provenance for artifacts produced on insomnia-ee
+        run: |
+          slsa-verifier verify-artifact \
+          --print-provenance \
+          --provenance-path '${{env.ARTIFACTS_DOWNLOAD_PATH}}/inso-provenance.intoto.jsonl' \
+          --source-uri 'github.com/Kong/insomnia-ee' \
+          ${{env.ARTIFACTS_DOWNLOAD_PATH}}/inso-*-${{env.RELEASE_VERSION}}.{zip,tar.xz,pkg}
+
+      - name: Verify Insomnia App Binary Provenance for artifacts produced on insomnia-ee
+        run: |
+          slsa-verifier verify-artifact \
+          --print-provenance \
+          --provenance-path '${{env.ARTIFACTS_DOWNLOAD_PATH}}/insomnia-provenance.intoto.jsonl' \
+          --source-uri 'github.com/Kong/insomnia-ee' \
+          ${{env.ARTIFACTS_DOWNLOAD_PATH}}/Insomnia.Core-${{env.RELEASE_VERSION}}.{snap,tar.gz,zip,rpm,dmg,deb,AppImage,exe}
 
       - name: Create Tag and Release
         uses: ncipollo/release-action@v1
         id: core_tag_and_release
         with:
           tag: ${{ env.RELEASE_CORE_TAG }}
-          name: "Insomnia ${{ env.RELEASE_VERSION }} 📦"
+          name: "${{ env.RELEASE_VERSION }} 📦"
           generateReleaseNotes: true
           commit: ${{ env.RELEASE_BRANCH }}
           prerelease: ${{ env.IS_PRERELEASE }}
@@ -119,12 +142,12 @@ jobs:
         with:
           release_id: ${{ steps.core_tag_and_release.outputs.id }}
           tag_name: ${{ env.RELEASE_CORE_TAG }}
-          file: "./artifacts/*-latest-artifacts/insomnia/**"
+          file: "./artifacts/*"
           prerelease: ${{ env.IS_PRERELEASE }}
           draft: false
 
       - name: Publish beta/stable of Insomnia to Insomnia API
-        if: "!contains(github.event.inputs.version, 'alpha')"
+        if: ${{ !contains(github.event.inputs.version, 'alpha') }}
         run: |
           curl \
             --fail \
@@ -141,7 +164,7 @@ jobs:
           RELEASE_CHANNEL: ${{ contains(github.event.inputs.version, 'beta') && 'beta' || 'stable' }}
 
       - name: Publish beta/stable of inso to Insomnia API
-        if: "!contains(github.event.inputs.version, 'alpha')"
+        if: ${{ !contains(github.event.inputs.version, 'alpha') }}
         run: |
           curl \
             --fail \
@@ -154,55 +177,8 @@ jobs:
           INSOMNIA_API_URL: ${{ secrets.INSOMNIA_API_URL }}
           INSOMNIA_API_TOKEN: ${{ secrets.INSOMNIA_API_TOKEN }}
           RELEASE_APP: com.insomnia.inso
-          RELEASE_VERSION: ${{ env.INSO_VERSION }}
+          RELEASE_VERSION: ${{ env.RELEASE_VERSION }}
           RELEASE_CHANNEL: ${{ contains(github.event.inputs.version, 'beta') && 'beta' || 'stable' }}
-
-      - name: Upload to snapcraft (beta and stable only)
-        if: "!contains(github.event.inputs.version, 'alpha')"
-        uses: snapcore/action-publish@7fe468c9de12396a9c8964af5d0dfd1d5b493bd7
-        env:
-          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_LOGIN_FILE }}
-        with:
-          snap: artifacts/ubuntu-latest-artifacts/insomnia/dist/Insomnia.Core-${{ env.RELEASE_VERSION }}.snap
-          release: ${{ contains(github.event.inputs.version, 'beta') && 'beta' || 'stable' }}
-
-      - name: Upload .deb to pulp and/or cloudsmith (stable only)
-        uses: docker://kong/release-script:latest
-        env:
-          PULP_USERNAME: ${{ secrets.PULP_USERNAME }}
-          PULP_PASSWORD: ${{ secrets.PULP_PASSWORD }}
-          PULP_HOST: ${{ secrets.PULP_HOST }}
-          VERBOSE: ${{ runner.debug == '1' && '1' || '' }}
-          CLOUDSMITH_API_KEY: ${{ secrets.CLOUDSMITH_API_KEY }}
-          CLOUDSMITH_DRY_RUN: ''
-          IGNORE_CLOUDSMITH_FAILURES: ${{ vars.IGNORE_CLOUDSMITH_FAILURES }}
-          USE_CLOUDSMITH: ${{ vars.USE_CLOUDSMITH }}
-          USE_PULP: ${{ vars.USE_PULP }}
-        with:
-          entrypoint: /entrypoint.sh
-          args: >
-            release
-            --file artifacts/ubuntu-latest-artifacts/insomnia/dist/Insomnia.Core-${{ env.RELEASE_VERSION }}.deb
-            --dist-name ubuntu
-            --dist-version focal
-            --package-type insomnia
-            ${{ env.IS_PRERELEASE == 'true' && '--internal' || '--publish' }}
-
-      - name: Push Inso CLI docker image tags to Docker Hub
-        run: |
-          echo -n $DOCKER_REGISTRY_TOKEN | docker login -u "$DOCKER_REGISTRY_USER" --password-stdin $DOCKER_REGISTRY
-          docker load -i ./artifacts/ubuntu-latest-artifacts/insomnia-inso/artifacts/inso-docker-image.tar
-          docker tag insomnia-inso:temp ${DOCKER_REGISTRY}/${DOCKER_IMAGE}:${{ env.INSO_VERSION }}
-          docker tag insomnia-inso:temp ${DOCKER_REGISTRY}/${DOCKER_IMAGE}:${DOCKER_LATEST_TAG}
-          docker push ${DOCKER_REGISTRY}/${DOCKER_IMAGE}:${{ env.INSO_VERSION }}
-          docker push ${DOCKER_REGISTRY}/${DOCKER_IMAGE}:${DOCKER_LATEST_TAG}
-
-        env:
-          DOCKER_REGISTRY_TOKEN: ${{ secrets.DOCKER_REGISTRY_TOKEN }}
-          DOCKER_REGISTRY_USER: ${{ secrets.DOCKER_REGISTRY_USER }}
-          DOCKER_REGISTRY: docker.io
-          DOCKER_IMAGE: kong/inso
-          DOCKER_LATEST_TAG: ${{ env.IS_PRERELEASE == 'false' && 'latest' || contains(github.event.inputs.version, 'alpha') && 'alpha' || 'beta' }}
 
       - name: Upload sourcemaps to Sentry
         env:
@@ -216,6 +192,41 @@ jobs:
           sentry-cli releases set-commits ${{ env.RELEASE_VERSION }} --commit 'Kong/insomnia@${{ env.RELEASE_BRANCH }}'
 
           sentry-cli sourcemaps upload -r ${{ env.RELEASE_VERSION }} ./artifacts/*-latest-sentry
+
+      - name: Upload x64 Linux snap to snapcraft (beta and stable only)
+        if: ${{ !contains(github.event.inputs.version, 'alpha') }}
+        uses: canonical/action-publish@v1
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_LOGIN_FILE_NEW }}
+        with:
+          # TODO-ARM64: Replace to *-amd64.snap when we have ARM64 build from insomnia-ee
+          snap: artifacts/Insomnia.Core-${{ env.RELEASE_VERSION }}.snap
+          release: ${{ contains(github.event.inputs.version, 'beta') && 'beta' || 'stable' }}
+
+      # TODO: also release for aarch64 Linux?
+      - name: Upload .deb to pulp and/or cloudsmith (stable only)
+        if: ${{ !contains(github.event.inputs.version, 'alpha') && !contains(github.event.inputs.version, 'beta') }}
+        uses: docker://kong/release-script:latest
+        env:
+          PULP_USERNAME: ${{ secrets.PULP_USERNAME }}
+          PULP_PASSWORD: ${{ secrets.PULP_PASSWORD }}
+          PULP_HOST: ${{ secrets.PULP_HOST }}
+          VERBOSE: ${{ runner.debug == '1' && '1' || '' }}
+          CLOUDSMITH_API_KEY: ${{ secrets.CLOUDSMITH_API_KEY }}
+          CLOUDSMITH_DRY_RUN: ''
+          IGNORE_CLOUDSMITH_FAILURES: ${{ vars.IGNORE_CLOUDSMITH_FAILURES }}
+          USE_CLOUDSMITH: ${{ vars.USE_CLOUDSMITH }}
+          USE_PULP: ${{ vars.USE_PULP }}
+        with:
+          entrypoint: /entrypoint.sh
+          # TODO-ARM64: Replace to *-amd64.deb when we have arm64 builds from insomnia-ee
+          args: >
+            release
+            --file artifacts/Insomnia.Core-${{ env.RELEASE_VERSION }}.deb
+            --dist-name ubuntu
+            --dist-version focal
+            --package-type insomnia
+            ${{ env.IS_PRERELEASE == 'true' && '--internal' || '--publish' }}
 
       - name: Configure Git user
         uses: Homebrew/actions/git-user-config@master

@@ -2,9 +2,9 @@ import { useEffect, useState } from 'react';
 import { useRouteLoaderData } from 'react-router-dom';
 import { useParams } from 'react-router-dom';
 
-import { ChangeBufferEvent, database } from '../../common/database';
-import { BaseModel } from '../../models';
-import { WorkspaceLoaderData } from '../routes/workspace';
+import { type ChangeBufferEvent, database } from '../../common/database';
+import type { BaseModel } from '../../models';
+import type { WorkspaceLoaderData } from '../routes/workspace';
 // We use this hook to determine if the active request has been updated from the system (not the user typing)
 // For example, by pulling a new version from the remote, switching branches, etc.
 export function useActiveRequestSyncVCSVersion() {
@@ -38,7 +38,7 @@ export function useActiveApiSpecSyncVCSVersion() {
 // For example, by pulling a new version from the remote, switching branches, etc.
 export function useGitVCSVersion() {
   const {
-    activeWorkspaceMeta,
+    gitRepository,
   } = useRouteLoaderData(':workspaceId') as WorkspaceLoaderData;
-  return ((activeWorkspaceMeta?.cachedGitLastCommitTime + '') + activeWorkspaceMeta?.cachedGitRepositoryBranch) + '';
+  return ((gitRepository?.cachedGitLastCommitTime + '') + gitRepository?.cachedGitRepositoryBranch) + '';
 }

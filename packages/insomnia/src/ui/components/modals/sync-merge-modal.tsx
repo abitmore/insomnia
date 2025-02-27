@@ -1,20 +1,36 @@
-import { Differ, Viewer } from 'json-diff-kit';
-import React, { forwardRef, useImperativeHandle, useState } from 'react';
+import React, { forwardRef, useCallback, useImperativeHandle, useState } from 'react';
 import { Button, Dialog, Form, GridList, GridListItem, Heading, Modal, ModalOverlay, Radio, RadioGroup } from 'react-aria-components';
+import { stringify } from 'yaml';
 
 import type { MergeConflict } from '../../../sync/types';
 import { SegmentEvent } from '../../analytics';
+import { DiffEditor } from '../diff-view-editor';
 import { Icon } from '../icon';
 
-const differ = new Differ({
-  detectCircular: true,
-  maxDepth: Infinity,
-  showModifications: true,
-  arrayDiffMethod: 'lcs',
-});
+function getDiffFromConflict(conflict: MergeConflict) {
+  let before = '';
+  let after = '';
 
-function getDiff(conflict: MergeConflict) {
-  return differ.diff(conflict.mineBlobContent, conflict.theirsBlobContent);
+  if (conflict.mineBlobContent) {
+    try {
+      before = stringify(conflict.mineBlobContent);
+    } catch (error) {
+      console.warn('Failed to stringify mineBlobContent', error);
+    }
+  }
+
+  if (conflict.theirsBlobContent) {
+    try {
+      after = stringify(conflict.theirsBlobContent);
+    } catch (error) {
+      console.warn('Failed to stringify theirsBlobContent', error);
+    }
+  }
+
+  return {
+    before,
+    after,
+  };
 }
 
 export interface SyncMergeModalOptions {
@@ -33,12 +49,17 @@ export const SyncMergeModal = forwardRef<SyncMergeModalHandle>((_, ref) => {
     labels: { ours: '', theirs: '' },
   });
 
-  useImperativeHandle(ref, () => ({
-    hide: () => setState({
+  const reset = useCallback(() => {
+    setState({
       conflicts: [],
       isOpen: false,
       labels: { ours: '', theirs: '' },
-    }),
+    });
+    setSelectedConflict(null);
+  }, []);
+
+  useImperativeHandle(ref, () => ({
+    hide: reset,
     show: ({ conflicts, labels, handleDone }) => {
       setState({
         conflicts,
@@ -46,26 +67,26 @@ export const SyncMergeModal = forwardRef<SyncMergeModalHandle>((_, ref) => {
         isOpen: true,
         labels,
       });
+      // select the first conflict by default
+      setSelectedConflict(conflicts?.[0] || null);
 
       window.main.trackSegmentEvent({
         event: SegmentEvent.syncConflictResolutionStart,
       });
     },
-  }), []);
+  }), [reset]);
 
   const { conflicts, handleDone } = state;
 
   const [selectedConflict, setSelectedConflict] = useState<MergeConflict | null>(null);
 
+  const selectedConflictDiff = selectedConflict ? getDiffFromConflict(selectedConflict) : null;
+
   return (
     <ModalOverlay
       isOpen={state.isOpen}
       onOpenChange={isOpen => {
-        !isOpen && setState({
-          conflicts: [],
-          isOpen: false,
-          labels: { ours: '', theirs: '' },
-        });
+        !isOpen && reset();
 
         !isOpen && handleDone?.();
       }}
@@ -74,11 +95,7 @@ export const SyncMergeModal = forwardRef<SyncMergeModalHandle>((_, ref) => {
     >
       <Modal
         onOpenChange={isOpen => {
-          !isOpen && setState({
-            conflicts: [],
-            isOpen: false,
-            labels: { ours: '', theirs: '' },
-          });
+          !isOpen && reset();
 
           !isOpen && handleDone?.();
         }}
@@ -116,11 +133,7 @@ export const SyncMergeModal = forwardRef<SyncMergeModalHandle>((_, ref) => {
                     });
                   }
 
-                  setState({
-                    conflicts: [],
-                    isOpen: false,
-                    labels: { ours: '', theirs: '' },
-                  });
+                  reset();
                 }}
               >
                 <div className='grid [grid-template-columns:300px_1fr] h-full overflow-hidden divide-x divide-solid divide-[--hl-md] gap-2'>
@@ -204,11 +217,7 @@ export const SyncMergeModal = forwardRef<SyncMergeModalHandle>((_, ref) => {
                     <div
                       className='bg-[--hl-xs] rounded-sm p-2 flex-1 overflow-y-auto text-[--color-font]'
                     >
-                      <Viewer
-                        diff={getDiff(selectedConflict)}
-                        hideUnchangedLines
-                        className='diff-viewer'
-                      />
+                      <DiffEditor original={selectedConflictDiff?.before || ''} modified={selectedConflictDiff?.after || ''} />
                     </div>
                   </div> : <div className='p-2 h-full flex flex-col gap-4 items-center justify-center'>
                     <Heading className='font-semibold flex justify-center items-center gap-2 text-4xl text-[--hl-md]'>

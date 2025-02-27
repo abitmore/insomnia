@@ -7,10 +7,12 @@
 @import './lib/codemirror/codemirror.css';
 @import './lib/codemirror/material.css';
 @import './main.css';
+@import 'monaco-editor/esm/vs/base/browser/ui/codicons/codicon/codicon.css';
 
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
 
 html {
   font-size: 11px;
@@ -157,4 +159,8 @@ table.json-diff-viewer {
 
 .bounce-in {
   animation: bounceIn 350ms ease-in;
+}
+
+.monaco-editor .margin {
+  margin: 0;
 }
